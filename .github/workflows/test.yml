@@ -1,0 +1,28 @@
+name: Behavioral tests
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ['3.10', '3.13']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Behavioral regressions
+        run: python -B -m unittest discover -s tests -v
+      - name: Build and verify actual bundle
+        run: python -B scripts/validate-skill-bundle.py . --pack task-observer.skill
+      - name: Verify packaged source parity
+        run: python -B scripts/validate-skill-bundle.py . --bundle task-observer.skill
