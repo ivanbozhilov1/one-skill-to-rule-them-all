@@ -12,7 +12,7 @@ Usage
   # validate parsing only, write nothing (safe on any log, incl. archives)
   python3 migrate-log.py --check log.md [more.md ...]
 
-  # convert an active log into a target directory
+  # convert an active log into a NEW target directory (parent must exist)
   python3 migrate-log.py --convert log.md --out observation-log/ \
       [--id-floor-from archive/]
 
@@ -25,14 +25,22 @@ Design notes
   string-vs-list. First entry is primary by convention.
 * Ambiguity is flagged, never guessed. Anything the parser is not confident
   about is written into the file as `migration_note` and listed in the report.
+* Conversion never merges into or replaces an existing output. A complete
+  sibling staging directory is published under an exclusive sibling lock.
+  Interrupted attempts retain their stage and lock for manual inspection;
+  choose a new output path, or recover these only after confirming no writer
+  is running. Source logs and archive inputs are never modified.
 """
 
 import argparse
+import ctypes
+import errno
 import json
 import os
+from pathlib import Path
 import re
 import sys
-from datetime import date
+import tempfile
 
 # --- labels lifted into frontmatter; everything else stays in the body ------
 META_LABELS = {
@@ -128,8 +136,16 @@ def parse_entries(text, source):
             if lm and not in_body:
                 label = lm.group(1).strip()
                 if label in META_LABELS:
+                    # These labels are aliases, and repeated references are
+                    # additive. Keep every value instead of replacing one.
+                    if label == "Reference files":
+                        label = "Reference file"
                     cur = label
-                    meta[label] = lm.group(2).strip()
+                    value = lm.group(2).strip()
+                    if label == "Reference file" and label in meta:
+                        meta[label] += "\n" + value
+                    else:
+                        meta[label] = value
                     continue
                 in_body = True
                 body_lines.append(ln)
@@ -318,70 +334,148 @@ def to_record(entry, known_skills):
     }
 
 
-def y(v):
-    """Emit a YAML scalar. JSON string syntax is a valid YAML subset."""
-    return json.dumps(v, ensure_ascii=False)
-
-
 def render(rec):
-    fm = [
-        "---",
-        f"id: {rec['id']}",
-        f"title: {y(rec['title'])}",
-        f"status: {rec['status']}",
-    ]
-    if rec["type"]:
-        fm.append(f"type: {rec['type']}")
-    fm.append("skill: [" + ", ".join(y(s) for s in rec["skill"]) + "]")
-    if rec["proposes_skill"]:
-        fm.append("proposes_skill: [" + ", ".join(y(c) for c in rec["proposes_skill"]) + "]")
-    if rec["area"]:
-        fm.append(f"area: {y(rec['area'])}")
-    if rec["date"]:
-        fm.append(f"date: {rec['date']}")
-    if rec["session_context"]:
-        fm.append(f"session_context: {y(rec['session_context'])}")
-    if rec["resolved"]:
-        fm.append(f"resolved: {rec['resolved']}")
+    """JSON-object frontmatter is YAML 1.2 and needs no optional parser."""
+    fm = {k: rec[k] for k in ("id", "title", "status", "skill")}
+    for key in ("type", "proposes_skill", "area", "date", "session_context",
+                "resolution", "status_note", "reference", "skill_qualifiers"):
+        if rec.get(key):
+            fm[key] = rec[key]
+    if rec.get("resolved"):
+        fm["resolved"] = rec["resolved"]
     elif rec["resolved_hint"]:
-        fm.append(f"resolved: null   # candidate from body text: {rec['resolved_hint']} — unconfirmed")
-    if rec["resolution"]:
-        fm.append(f"resolution: {y(rec['resolution'])}")
-    if rec.get("status_note"):
-        fm.append(f"status_note: {y(rec['status_note'])}")
-    if rec["reference"]:
-        fm.append(f"reference: {y(rec['reference'])}")
-    if rec["skill_qualifiers"]:
-        fm.append("skill_qualifiers:")
-        for k, v in rec["skill_qualifiers"].items():
-            fm.append(f"  {k}: {y(v if isinstance(v, str) else '; '.join(v))}")
+        fm["resolved"] = None
+        fm["resolved_hint"] = rec["resolved_hint"]
     if rec.get("override_reason"):
-        fm.append(f"migration_override: {y(rec['override_reason'])}")
+        fm["migration_override"] = rec["override_reason"]
     needs = sorted(set(rec["flags"]) & REVIEW_FLAGS)
     if needs:
-        fm.append(f"migration_note: {y('needs review: ' + ', '.join(needs))}")
-    fm.append("---")
-    return "\n".join(fm) + "\n\n" + rec["body"] + "\n"
+        fm["migration_note"] = "needs review: " + ", ".join(needs)
+    return "---\n" + json.dumps(fm, ensure_ascii=False, indent=2) + "\n---\n\n" + rec["body"] + "\n"
 
 
 def id_floor_from(paths):
+    """Read every historical floor; unreadable or invalid inputs fail closed."""
     hi = 0
+
+    def fail_walk(error):
+        raise error
+
     for p in paths:
-        for root, _, files in os.walk(p):
+        if not os.path.isdir(p):
+            raise ValueError(f"ID floor input is not a directory: {p}")
+        for root, _, files in os.walk(p, onerror=fail_walk):
             for f in files:
-                if f.endswith(".md"):
-                    try:
-                        with open(os.path.join(root, f), encoding="utf-8") as fh:
-                            for ln in fh:
-                                m = ENTRY_RE.match(ln)
-                                if m:
-                                    hi = max(hi, int(m.group(1)))
-                    except OSError:
-                        pass
+                path = os.path.join(root, f)
+                if f == ".id-floor":
+                    with open(path, encoding="utf-8") as fh:
+                        value = fh.read().strip()
+                    if not re.fullmatch(r"[0-9]+", value):
+                        raise ValueError(f"Invalid ID floor: {path}")
+                    hi = max(hi, int(value))
+                elif f.endswith(".md"):
+                    with open(path, encoding="utf-8") as fh:
+                        for ln in fh:
+                            m = ENTRY_RE.match(ln)
+                            if m:
+                                hi = max(hi, int(m.group(1)))
                 mm = re.match(r"^(\d+)-", f)
                 if mm:
                     hi = max(hi, int(mm.group(1)))
     return hi
+
+
+def prepare_output(records, floor_paths):
+    """Check and render the complete output before creating any files."""
+    if not records:
+        raise ValueError("No observations parsed; refusing to publish an empty migration")
+    ids, names, outputs = set(), set(), []
+    for rec in records:
+        ident = rec["id"]
+        if type(ident) is not int or ident < 0:
+            raise ValueError(f"Observation ID must be a non-negative integer: {ident!r}")
+        if not isinstance(rec["title"], str) or not isinstance(rec["body"], str):
+            raise ValueError(f"Observation {ident}: title and body must be strings")
+        filename = f"{ident:04d}-{slugify(rec['title'])}.md"
+        if ident in ids or filename.casefold() in names:
+            raise ValueError(f"Duplicate observation ID or output filename: {ident} ({filename})")
+        if rec["status"] not in ("open", "actioned", "declined", "superseded"):
+            raise ValueError(f"Observation {ident}: invalid status")
+        for key in ("skill", "proposes_skill"):
+            if not isinstance(rec[key], list) or any(not isinstance(s, str) for s in rec[key]):
+                raise ValueError(f"Observation {ident}: {key} must be a list of strings")
+        content = render(rec)
+        content.encode("utf-8")  # Fail before staging if an override is not encodable.
+        outputs.append((filename, content))
+        ids.add(ident)
+        names.add(filename.casefold())
+    return outputs, max(max(ids), id_floor_from(floor_paths))
+
+
+def write_staged_file(path, content):
+    with open(path, "x", encoding="utf-8", newline="\n") as fh:
+        fh.write(content)
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def rename_new_directory(stage, out):
+    """Publish atomically without replacing even a concurrently created path."""
+    if os.name == "nt":
+        os.rename(stage, out)  # Windows refuses an existing destination.
+        return
+    if sys.platform.startswith("linux"):
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = getattr(libc, "renameat2", None)
+        if renameat2 is not None:
+            renameat2.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
+                                 ctypes.c_char_p, ctypes.c_uint)
+            renameat2.restype = ctypes.c_int
+            if renameat2(-100, os.fsencode(stage), -100, os.fsencode(out), 1) == 0:
+                return
+            code = ctypes.get_errno()
+            raise OSError(code, os.strerror(code), str(out))
+    # A normal POSIX rename could silently replace an empty destination.
+    raise OSError(errno.ENOTSUP, "Atomic no-replace directory publication is unavailable")
+
+
+def convert(records, out, floor_paths):
+    out = Path(os.path.abspath(out))
+    if os.path.lexists(out):
+        raise ValueError(f"Output already exists; choose a new directory: {out}")
+    if not out.parent.is_dir():
+        raise ValueError(f"Output parent must already exist: {out.parent}")
+    outputs, floor = prepare_output(records, floor_paths)
+    lock = out.parent / f".{out.name}.migration.lock"
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        raise ValueError(f"Migration lock exists; inspect the prior attempt before retrying: {lock}") from None
+    stage = None
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"pid": os.getpid(), "output": str(out)}, fh)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        if os.path.lexists(out):
+            raise ValueError(f"Output appeared during preflight; refusing to replace it: {out}")
+        stage = Path(tempfile.mkdtemp(prefix=f".{out.name}.migration-stage-", dir=out.parent))
+        for filename, content in outputs:
+            write_staged_file(stage / filename, content)
+        (stage / "archive").mkdir()
+        write_staged_file(stage / "archive" / ".id-floor", f"{floor}\n")
+        rename_new_directory(stage, out)
+    except BaseException:
+        print(f"Migration interrupted. Recovery lock: {lock}; staging: {stage or 'not created'}. "
+              "Inspect these after confirming no writer is running; no automatic cleanup was performed.",
+              file=sys.stderr)
+        raise
+    try:
+        lock.unlink()
+    except OSError as error:
+        print(f"Published complete output; could not remove lock {lock}: {error}", file=sys.stderr)
+    return out, floor
 
 
 def main():
@@ -395,11 +489,12 @@ def main():
                 stream.reconfigure(errors="replace")
             except (ValueError, AttributeError):
                 pass
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("logs", nargs="+")
-    ap.add_argument("--check", action="store_true", help="parse and report only")
-    ap.add_argument("--convert", action="store_true", help="write output files")
-    ap.add_argument("--out")
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--check", action="store_true", help="parse and report only (default; no writes)")
+    mode.add_argument("--convert", action="store_true", help="publish complete output to a NEW directory")
+    ap.add_argument("--out", help="new output directory; parent must exist; occupied output is never replaced")
     ap.add_argument("--id-floor-from", action="append", default=[])
     ap.add_argument("--known-skills")
     ap.add_argument("--overrides", help="JSON file of manual resolutions, keyed by id")
@@ -452,18 +547,12 @@ def main():
     if not args.convert:
         return
 
-    out = args.out or "observation-log"
-    os.makedirs(out, exist_ok=True)
-    for r in records:
-        fn = f"{r['id']:04d}-{slugify(r['title'])}.md"
-        with open(os.path.join(out, fn), "w", encoding="utf-8") as fh:
-            fh.write(render(r))
-
-    floor = max([r["id"] for r in records] + [id_floor_from(args.id_floor_from)])
-    arch = os.path.join(out, "archive")
-    os.makedirs(arch, exist_ok=True)
-    with open(os.path.join(arch, ".id-floor"), "w") as fh:
-        fh.write(f"{floor}\n")
+    try:
+        out, floor = convert(records, args.out or "observation-log", args.id_floor_from)
+    except (OSError, ValueError, TypeError, KeyError) as error:
+        print(f"Conversion refused: {error}", file=sys.stderr)
+        return 1
+    arch = out / "archive"
 
     print(f"\nwrote {len(records)} files to {out}/")
     print(f"id floor: {floor}  (-> {os.path.join(arch, '.id-floor')})")
@@ -480,4 +569,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
