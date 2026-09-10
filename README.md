@@ -15,7 +15,7 @@ python -B scripts/validate-skill-bundle.py . --pack task-observer.skill
 
 Extract the verified task-observer directory into your configured skills directory (Codex: the active CODEX_HOME/skills). Preserve the full runtime bundle. Use the authoritative source and deployment mechanism for managed skills. The validator checks actual archive members against source; do not install an unrelated archive just because the source passes checks.
 
-Ask the agent to observe a task for skill improvements or review an observation backlog. No global session hook or unattended schedule is added. Store observations in a separate persistent absolute workspace and initialize it with the helper; see [user guide](USER-GUIDE.md).
+Ask the agent to observe a task for skill improvements or review an observation backlog. Installing the bundle alone adds no global hook or schedule. An explicitly authorized Codex host can enable the optional [automatic adapter](references/automation.md). Store observations in a separate persistent absolute workspace and initialize it with the helper; see [user guide](USER-GUIDE.md).
 
 ## What changed
 
